@@ -1,54 +1,77 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from azure.storage.blob import BlobServiceClient
 import os
+import pyodbc
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import URL
+app = FastAPI()
 
-load_dotenv()
+# -----------------------------
+# Azure SQL Configuration
+# -----------------------------
 
-app = FastAPI(
-    title="Azure FastAPI Employee API",
-    description="FastAPI application connected to Azure SQL Database",
-    version="1.0.0"
+DB_SERVER = os.getenv("DB_SERVER")
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+
+# -----------------------------
+# Azure Blob Storage
+# -----------------------------
+
+AZURE_STORAGE_CONNECTION_STRING = os.getenv(
+    "AZURE_STORAGE_CONNECTION_STRING"
 )
 
+CONTAINER_NAME = "learning-data"
 
-# Azure SQL connection
-connection_url = URL.create(
-    "mssql+pyodbc",
-    username=os.getenv("DB_USER"),
-    password=os.getenv("DB_PASSWORD"),
-    host=os.getenv("DB_SERVER"),
-    database=os.getenv("DB_NAME"),
-    query={
-        "driver": "ODBC Driver 18 for SQL Server",
-        "Encrypt": "yes",
-        "TrustServerCertificate": "no",
-    },
-)
-
-engine = create_engine(connection_url)
+if AZURE_STORAGE_CONNECTION_STRING:
+    blob_service_client = BlobServiceClient.from_connection_string(
+        AZURE_STORAGE_CONNECTION_STRING
+    )
+    container_client = blob_service_client.get_container_client(
+        CONTAINER_NAME
+    )
+else:
+    blob_service_client = None
+    container_client = None
 
 
-# Employee request model
-class Employee(BaseModel):
-    id: int
-    name: str
-    department: str
-    salary: int
+# -----------------------------
+# Database Connection
+# -----------------------------
+
+def get_connection():
+    connection_string = (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={DB_SERVER};"
+        f"DATABASE={DB_NAME};"
+        f"UID={DB_USER};"
+        f"PWD={DB_PASSWORD};"
+        "Encrypt=yes;"
+        "TrustServerCertificate=no;"
+        "Connection Timeout=30;"
+    )
+
+    return pyodbc.connect(connection_string)
 
 
-# Home endpoint
+# -----------------------------
+# Home
+# -----------------------------
+
 @app.get("/")
 def home():
     return {
-        "message": "FastAPI is running on Azure"
+        "message": "FastAPI is running on Azure",
+        "database": "Azure SQL",
+        "storage": "Azure Blob Storage"
     }
 
 
-# Health check endpoint
+# -----------------------------
+# Health Check
+# -----------------------------
+
 @app.get("/health")
 def health():
     return {
@@ -56,23 +79,35 @@ def health():
     }
 
 
-# Get all employees
+# -----------------------------
+# Get Employees
+# -----------------------------
+
 @app.get("/employees")
 def get_employees():
-    try:
-        with engine.connect() as connection:
-            result = connection.execute(
-                text("""
-                    SELECT id, name, department, salary
-                    FROM employees
-                    ORDER BY id
-                """)
-            )
 
-            employees = [
-                dict(row._mapping)
-                for row in result
-            ]
+    try:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            "SELECT id, name, department, salary FROM employees"
+        )
+
+        rows = cursor.fetchall()
+
+        employees = []
+
+        for row in rows:
+            employees.append({
+                "id": row.id,
+                "name": row.name,
+                "department": row.department,
+                "salary": row.salary
+            })
+
+        cursor.close()
+        connection.close()
 
         return {
             "employees": employees
@@ -81,86 +116,88 @@ def get_employees():
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Database error: {str(e)}"
+            detail=str(e)
         )
 
 
-# Create a new employee
-@app.post("/employees", status_code=201)
-def create_employee(employee: Employee):
+# -----------------------------
+# Upload File to Blob Storage
+# -----------------------------
+
+@app.post("/files/upload")
+async def upload_file(file: UploadFile = File(...)):
+
+    if container_client is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Azure Storage is not configured"
+        )
+
     try:
-        with engine.begin() as connection:
+        blob_client = container_client.get_blob_client(file.filename)
 
-            # Check whether ID already exists
-            existing = connection.execute(
-                text("""
-                    SELECT id
-                    FROM employees
-                    WHERE id = :id
-                """),
-                {"id": employee.id}
-            ).fetchone()
+        contents = await file.read()
 
-            if existing:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Employee with this ID already exists"
-                )
-
-            connection.execute(
-                text("""
-                    INSERT INTO employees
-                    (id, name, department, salary)
-                    VALUES
-                    (:id, :name, :department, :salary)
-                """),
-                employee.model_dump()
-            )
+        blob_client.upload_blob(
+            contents,
+            overwrite=True
+        )
 
         return {
-            "message": "Employee created successfully",
-            "employee": employee.model_dump()
+            "message": "File uploaded successfully",
+            "filename": file.filename,
+            "container": CONTAINER_NAME
         }
-
-    except HTTPException:
-        raise
 
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Database error: {str(e)}"
+            detail=str(e)
         )
 
 
-# Get employee by ID
-@app.get("/employees/{employee_id}")
-def get_employee(employee_id: int):
-    try:
-        with engine.connect() as connection:
-            result = connection.execute(
-                text("""
-                    SELECT id, name, department, salary
-                    FROM employees
-                    WHERE id = :id
-                """),
-                {"id": employee_id}
-            ).fetchone()
+# -----------------------------
+# List Files
+# -----------------------------
 
-        if not result:
-            raise HTTPException(
-                status_code=404,
-                detail="Employee not found"
-            )
+@app.get("/files")
+def list_files():
+
+    if container_client is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Azure Storage is not configured"
+        )
+
+    try:
+        files = []
+
+        for blob in container_client.list_blobs():
+            files.append({
+                "name": blob.name,
+                "size": blob.size
+            })
 
         return {
-            "employee": dict(result._mapping)
+            "files": files
         }
-
-    except HTTPException:
-        raise
 
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Database error: {str(e)}"
+            detail=str(e)
         )
+
+
+import os
+
+@app.get("/config-check")
+def config_check():
+    return {
+        "storage_configured": bool(
+            os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+        ),
+        "db_configured": bool(
+            os.getenv("DB_SERVER")
+        )
+    }
