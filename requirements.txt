@@ -1,6 +1,6 @@
 fastapi
 uvicorn
 gunicorn
+python-multipart
 azure-storage-blob
 pyodbc
-python-multipart
